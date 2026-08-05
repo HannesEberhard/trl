@@ -994,51 +994,51 @@ def identity(x):
 
 def split_pixel_values_by_grid(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor | list[torch.Tensor]]:
     """
-    Splits `batch["pixel_values"]` into a list of tensors, one per sample, based on `batch["num_images"]`.
+    Splits `batch["pixel_values"]` into a list of tensors, one per sample, based on `batch["num_images"]`. Also
+    splits `batch["pixel_values_videos"]` the same way, based on `batch["num_videos"]`.
 
     For models with `image_grid_thw` (e.g. Qwen), the grid dimensions determine how many rows of `pixel_values` belong
     to each image. For models with `image_position_ids` instead (e.g. Gemma), `pixel_values` is indexed directly by
     image count. For models with `spatial_shapes` (e.g. LFM2-VL), tile-indexed tensors are split using `num_tiles`.
+    `pixel_values_videos`/`video_position_ids` (e.g. Gemma) are always indexed directly by video count.
     """
-    if "pixel_values" not in batch or "num_images" not in batch:
-        return batch
+    batch = dict(batch)
 
-    num_images = batch["num_images"]
-    pixel_values = batch["pixel_values"]  # [total, feature_dim]
+    if "pixel_values" in batch and "num_images" in batch:
+        num_images = batch["num_images"]
+        pixel_values = batch["pixel_values"]  # [total, feature_dim]
 
-    if "image_grid_thw" in batch:
-        lengths = batch["image_grid_thw"].prod(-1).tolist()  # [num_images]
-        if sum(lengths) != pixel_values.size(0):
-            raise ValueError(
-                f"Mismatch: sum(lengths) = {sum(lengths)} != pixel_values.size(0) = {pixel_values.size(0)}"
-            )
+        if "image_grid_thw" in batch:
+            lengths = batch["image_grid_thw"].prod(-1).tolist()  # [num_images]
+            if sum(lengths) != pixel_values.size(0):
+                raise ValueError(
+                    f"Mismatch: sum(lengths) = {sum(lengths)} != pixel_values.size(0) = {pixel_values.size(0)}"
+                )
 
-        boundaries = [0, *accumulate(num_images)]
-        image_grid_thw = batch["image_grid_thw"]  # [total, 3]
-        sections = [sum(lengths[boundaries[i] : boundaries[i + 1]]) for i in range(len(num_images))]
-        split_pixel_values = list(torch.split(pixel_values, sections, dim=0))
-        split_image_grid_thw = list(torch.split(image_grid_thw, num_images, dim=0))
-        return {**batch, "pixel_values": split_pixel_values, "image_grid_thw": split_image_grid_thw}
+            boundaries = [0, *accumulate(num_images)]
+            image_grid_thw = batch["image_grid_thw"]  # [total, 3]
+            sections = [sum(lengths[boundaries[i] : boundaries[i + 1]]) for i in range(len(num_images))]
+            batch["pixel_values"] = list(torch.split(pixel_values, sections, dim=0))
+            batch["image_grid_thw"] = list(torch.split(image_grid_thw, num_images, dim=0))
 
-    if "image_position_ids" in batch:
-        image_position_ids = batch["image_position_ids"]  # [total]
-        split_pixel_values = list(torch.split(pixel_values, num_images, dim=0))
-        split_image_position_ids = list(torch.split(image_position_ids, num_images, dim=0))
-        return {**batch, "pixel_values": split_pixel_values, "image_position_ids": split_image_position_ids}
+        elif "image_position_ids" in batch:
+            image_position_ids = batch["image_position_ids"]  # [total]
+            batch["pixel_values"] = list(torch.split(pixel_values, num_images, dim=0))
+            batch["image_position_ids"] = list(torch.split(image_position_ids, num_images, dim=0))
 
-    if "spatial_shapes" in batch:
-        num_tiles = batch["num_tiles"]
-        pixel_attention_mask = batch["pixel_attention_mask"]
-        spatial_shapes = batch["spatial_shapes"]
-        split_pixel_values = list(torch.split(pixel_values, num_tiles, dim=0))
-        split_pixel_attention_mask = list(torch.split(pixel_attention_mask, num_tiles, dim=0))
-        split_spatial_shapes = list(torch.split(spatial_shapes, num_tiles, dim=0))
-        return {
-            **batch,
-            "pixel_values": split_pixel_values,
-            "pixel_attention_mask": split_pixel_attention_mask,
-            "spatial_shapes": split_spatial_shapes,
-        }
+        elif "spatial_shapes" in batch:
+            num_tiles = batch["num_tiles"]
+            pixel_attention_mask = batch["pixel_attention_mask"]
+            spatial_shapes = batch["spatial_shapes"]
+            batch["pixel_values"] = list(torch.split(pixel_values, num_tiles, dim=0))
+            batch["pixel_attention_mask"] = list(torch.split(pixel_attention_mask, num_tiles, dim=0))
+            batch["spatial_shapes"] = list(torch.split(spatial_shapes, num_tiles, dim=0))
+
+    if "pixel_values_videos" in batch and "num_videos" in batch:
+        num_videos = batch["num_videos"]
+        batch["pixel_values_videos"] = list(torch.split(batch["pixel_values_videos"], num_videos, dim=0))
+        if "video_position_ids" in batch:
+            batch["video_position_ids"] = list(torch.split(batch["video_position_ids"], num_videos, dim=0))
 
     return batch
 
@@ -1072,6 +1072,16 @@ def unsplit_pixel_values_by_grid(batch: dict[str, torch.Tensor | list[torch.Tens
     if isinstance(spatial_shapes, list):
         merged = torch.cat(spatial_shapes, dim=0)
         batch = {**batch, "spatial_shapes": merged}
+
+    pixel_values_videos = batch.get("pixel_values_videos")
+    if isinstance(pixel_values_videos, list):
+        merged = torch.cat(pixel_values_videos, dim=0)
+        batch = {**batch, "pixel_values_videos": merged}
+
+    video_position_ids = batch.get("video_position_ids")
+    if isinstance(video_position_ids, list):
+        merged = torch.cat(video_position_ids, dim=0)
+        batch = {**batch, "video_position_ids": merged}
 
     return batch
 

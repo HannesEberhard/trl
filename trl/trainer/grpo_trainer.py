@@ -402,9 +402,11 @@ class GRPOTrainer(_BaseTrainer):
                 if tid != self._tokenizer.unk_token_id:
                     self._image_pad_token_id = tid
                     break
-            tid = self._tokenizer.convert_tokens_to_ids("<|video_pad|>")
-            if tid != self._tokenizer.unk_token_id:
-                self._video_pad_token_id = tid
+            for candidate in ("<|video_pad|>", "<|video|>"):
+                tid = self._tokenizer.convert_tokens_to_ids(candidate)
+                if tid != self._tokenizer.unk_token_id:
+                    self._video_pad_token_id = tid
+                    break
 
         # PEFT
         if peft_config is not None:
@@ -1201,7 +1203,7 @@ class GRPOTrainer(_BaseTrainer):
         # and "attention_mask"). In GRPOTrainer, we preprocess data, so using the model's signature columns doesn't
         # work. Instead, we set them to the columns expected by the `training_step` method, hence the override.
         if self._signature_columns is None:
-            self._signature_columns = ["prompt", "image", "images"]
+            self._signature_columns = ["prompt", "image", "images", "video", "videos"]
 
     # This method overrides `Trainer.get_train_dataloader` to support our custom batching strategy.
     # Instead of returning a standard per-step batch (i.e., `per_device_batch_size), our dataloader loads an
@@ -1345,6 +1347,8 @@ class GRPOTrainer(_BaseTrainer):
         spatial_shapes=None,
         image_sizes=None,
         image_position_ids=None,
+        pixel_values_videos=None,
+        video_position_ids=None,
     ):
         if is_peft_model(unwrapped_model):
             unwrapped_model = unwrapped_model.base_model.model
@@ -1369,6 +1373,11 @@ class GRPOTrainer(_BaseTrainer):
             model_inputs["image_sizes"] = image_sizes
         if image_position_ids is not None:
             model_inputs["image_position_ids"] = image_position_ids
+        # For Gemma 4 (video)
+        if pixel_values_videos is not None:
+            model_inputs["pixel_values_videos"] = pixel_values_videos
+        if video_position_ids is not None:
+            model_inputs["video_position_ids"] = video_position_ids
 
         # Only add logits_to_keep if the model supports it
         if "logits_to_keep" in self.model_kwarg_keys:
@@ -1451,6 +1460,9 @@ class GRPOTrainer(_BaseTrainer):
         token_type_ids=None,
         mm_token_type_ids=None,
         image_position_ids=None,
+        pixel_values_videos=None,
+        video_position_ids=None,
+        num_videos=None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Compute log-probs, (optionally) entropies, and (optionally) the MoE load-balancing aux loss."""
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
@@ -1495,6 +1507,13 @@ class GRPOTrainer(_BaseTrainer):
                 model_inputs["token_type_ids"] = token_type_ids[start : start + batch_size]
             if mm_token_type_ids is not None:
                 model_inputs["mm_token_type_ids"] = mm_token_type_ids[start : start + batch_size]
+            if pixel_values_videos is not None:
+                # For Gemma 4: pixel_values_videos is indexed directly by video count, like image_position_ids.
+                cum_vids = torch.tensor([0] + num_videos).cumsum(0)
+                vid_start, vid_end = cum_vids[start], cum_vids[start + batch_size]
+                model_inputs["pixel_values_videos"] = pixel_values_videos[vid_start:vid_end]
+                if video_position_ids is not None:
+                    model_inputs["video_position_ids"] = video_position_ids[vid_start:vid_end]
 
             # Only add logits_to_keep if the model supports it
             if "logits_to_keep" in self.model_kwarg_keys:
@@ -1709,19 +1728,27 @@ class GRPOTrainer(_BaseTrainer):
             if self._is_vlm:
                 prompts = [prepare_multimodal_messages(prompt) for prompt in prompts]
 
-            # Extract images from messages for VLM support
+            # Extract images/videos from messages for VLM support
             images = []
+            videos = []
             has_images = False
+            has_videos = False
             for prompt in prompts:
                 prompt_images = []
+                prompt_videos = []
                 for message in prompt:
                     if isinstance(message["content"], list):
                         for part in message["content"]:
                             if part["type"] == "image":
                                 prompt_images.append(part["image"])
                                 has_images = True
+                            elif part["type"] == "video":
+                                prompt_videos.append(part["video"])
+                                has_videos = True
                 images.append(prompt_images if prompt_images else None)
+                videos.append(prompt_videos if prompt_videos else None)
             images = images if has_images else None
+            videos = videos if has_videos else None
 
             if self.environment_factories is not None:
                 # Tools differ per example across environments, so render each prompt with its own tool schema.
@@ -1749,7 +1776,7 @@ class GRPOTrainer(_BaseTrainer):
                     k: torch.cat(v) if isinstance(v[0], torch.Tensor) else [row for prompt_v in v for row in prompt_v]
                     for k, v in multimodal_fields.items()
                 }
-                return prompt_ids, images, multimodal_fields
+                return prompt_ids, images, videos, multimodal_fields
 
             # Workaround for a bug in transformers 5.3.0 where some processors (e.g. Qwen2.5-VL) crash on
             # batched unpadded input (transformers#44514).
@@ -1778,8 +1805,9 @@ class GRPOTrainer(_BaseTrainer):
         else:
             prompt_ids = self.processing_class(text=prompts)["input_ids"]
             images = None
+            videos = None
             multimodal_fields = {}
-        return prompt_ids, images, multimodal_fields
+        return prompt_ids, images, videos, multimodal_fields
 
     def _generate_single_turn(self, prompt_ids, images, multimodal_fields):
         device = self.accelerator.device
@@ -2166,9 +2194,10 @@ class GRPOTrainer(_BaseTrainer):
             extra_fields = {k: v for k, v in output.items() if k not in required_keys}
             prompt_ids, completion_ids, logprobs = output["prompt_ids"], output["completion_ids"], output["logprobs"]
             images = None
+            videos = None
             multimodal_fields = {}
         else:
-            prompt_ids, images, multimodal_fields = self._tokenize_prompts(prompts)
+            prompt_ids, images, videos, multimodal_fields = self._tokenize_prompts(prompts)
             completion_ids, logprobs = self._generate_single_turn(prompt_ids, images, multimodal_fields)
             extra_fields = {}
 
@@ -2255,7 +2284,7 @@ class GRPOTrainer(_BaseTrainer):
             )
             self._metrics[mode]["tools/failure_frequency"].append(failure_frequency)
 
-        return prompt_ids, completion_ids, tool_mask, completions, logprobs, extra_fields, images, tool_images
+        return prompt_ids, completion_ids, tool_mask, completions, logprobs, extra_fields, images, tool_images, videos
 
     def _generate_and_score_completions(
         self, inputs: list[dict[str, torch.Tensor | Any]]
@@ -2342,10 +2371,26 @@ class GRPOTrainer(_BaseTrainer):
         if images is not None and all(img_list == [] for img_list in images):
             images = None
 
-        # If the prompts are conversational and the inputs contain images, we need to convert the prompts from
+        if "videos" in inputs[0]:
+            videos = [example.get("videos") for example in inputs]
+        elif "video" in inputs[0]:
+            videos = [[example.get("video")] if example.get("video") is not None else None for example in inputs]
+        else:
+            videos = None
+        # Transformers requires at least one video in the batch, otherwise it throws an error
+        if videos is not None and all(vid_list == [] for vid_list in videos):
+            videos = None
+
+        if videos is not None and self.use_vllm:
+            raise NotImplementedError(
+                "Video inputs are not currently supported with `use_vllm=True`. Disable vLLM (`use_vllm=False`) "
+                "when training on datasets containing video data."
+            )
+
+        # If the prompts are conversational and the inputs contain images/videos, we need to convert the prompts from
         # [{"role": "user", "content": "What color is the sky?"}] to
         # [{"role": "user", "content": [{"type": "image", "image": <Image>}, {"type": "text", "text": "What color is the sky?"}]}]
-        if images is not None:
+        if images is not None or videos is not None:
             if not is_conversational(inputs[0]):
                 raise ValueError(
                     "Multimodal training requires conversational prompts. It looks like the dataset contains "
@@ -2353,12 +2398,15 @@ class GRPOTrainer(_BaseTrainer):
                     "to the trainer. Please provide the raw conversational prompts and let the trainer apply the chat "
                     "template internally."
                 )
+            images_or_none = images if images is not None else [None] * len(prompts)
+            videos_or_none = videos if videos is not None else [None] * len(prompts)
             prompts = [
-                prepare_multimodal_messages(prompt, images=image_list)
-                for prompt, image_list in zip(prompts, images, strict=True)
+                prepare_multimodal_messages(prompt, images=image_list, videos=video_list)
+                for prompt, image_list, video_list in zip(prompts, images_or_none, videos_or_none, strict=True)
             ]
 
         dataset_images = images  # preserve dataset images before _generate may overwrite
+        dataset_videos = videos  # preserve dataset videos before _generate may overwrite
         (
             prompt_ids_list,
             completion_ids_list,
@@ -2368,9 +2416,12 @@ class GRPOTrainer(_BaseTrainer):
             extra_fields,
             images,
             tool_images,
+            videos,
         ) = self._generate(prompts)
         if images is None:
             images = dataset_images  # restore dataset images (rollout_func path returns None)
+        if videos is None:
+            videos = dataset_videos  # restore dataset videos (rollout_func path returns None)
 
         # Convert lists of token IDs to padded tensors
         prompt_ids = [torch.tensor(ids) for ids in prompt_ids_list]
@@ -2434,6 +2485,7 @@ class GRPOTrainer(_BaseTrainer):
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
         num_images = [len(img_list) if img_list else 0 for img_list in images] if images is not None else None
+        num_videos = [len(vid_list) if vid_list else 0 for vid_list in videos] if videos is not None else None
 
         # Get forward_kwargs for models with multimodal inputs.
         # When tool images are present (from _tool_call_loop), use image_processor directly and build
@@ -2444,7 +2496,7 @@ class GRPOTrainer(_BaseTrainer):
             image_inputs = self.processing_class.image_processor(images=flat_images, return_tensors="pt")
             image_inputs = super()._prepare_inputs(image_inputs)
             forward_kwargs = dict(image_inputs)
-        elif images is not None:
+        elif images is not None or videos is not None:
             if self.environment_factories is not None:
                 per_prompt_tools = [self._env_tools[name] for name in self._batch_environments]
             else:
@@ -2455,7 +2507,9 @@ class GRPOTrainer(_BaseTrainer):
                 )["prompt"]
                 for prompt, tools in zip(prompts, per_prompt_tools, strict=True)
             ]
-            prompt_inputs = self.processing_class(images=images, text=prompts_text, padding=True, return_tensors="pt")
+            prompt_inputs = self.processing_class(
+                images=images, videos=videos, text=prompts_text, padding=True, return_tensors="pt"
+            )
             prompt_inputs = super()._prepare_inputs(prompt_inputs)
             forward_kwargs = {k: v for k, v in prompt_inputs.items() if k not in ["input_ids", "attention_mask"]}
         else:
@@ -2570,7 +2624,8 @@ class GRPOTrainer(_BaseTrainer):
                     batch_size,
                     num_images=num_images,
                     num_tiles=num_tiles,
-                    **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, spatial_shapes, image_sizes, image_position_ids
+                    num_videos=num_videos,
+                    **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, spatial_shapes, image_sizes, image_position_ids, pixel_values_videos, video_position_ids
                 )
             else:
                 old_per_token_logps = None
@@ -2633,7 +2688,8 @@ class GRPOTrainer(_BaseTrainer):
                         batch_size=batch_size,
                         num_images=num_images,
                         num_tiles=num_tiles,
-                        **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, spatial_shapes, image_sizes, image_position_ids
+                        num_videos=num_videos,
+                        **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, spatial_shapes, image_sizes, image_position_ids, pixel_values_videos, video_position_ids
                     )
                 else:
                     # When training a PEFT adapter, how we obtain the reference depends on the setup:
@@ -2649,7 +2705,8 @@ class GRPOTrainer(_BaseTrainer):
                             batch_size=batch_size,
                             num_images=num_images,
                             num_tiles=num_tiles,
-                            **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, spatial_shapes, image_sizes, image_position_ids
+                            num_videos=num_videos,
+                            **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, spatial_shapes, image_sizes, image_position_ids, pixel_values_videos, video_position_ids
                         )
             else:
                 ref_per_token_logps = None
@@ -2844,10 +2901,16 @@ class GRPOTrainer(_BaseTrainer):
             output["mm_token_type_ids"] = forward_kwargs["mm_token_type_ids"]
         if "image_position_ids" in forward_kwargs:
             output["image_position_ids"] = forward_kwargs["image_position_ids"]
+        if "pixel_values_videos" in forward_kwargs:
+            output["pixel_values_videos"] = forward_kwargs["pixel_values_videos"]
+        if "video_position_ids" in forward_kwargs:
+            output["video_position_ids"] = forward_kwargs["video_position_ids"]
         if images is not None:
             output["num_images"] = num_images
             if num_tiles is not None:
                 output["num_tiles"] = num_tiles
+        if videos is not None:
+            output["num_videos"] = num_videos
         if tool_mask is not None:
             output["tool_mask"] = tool_mask
         return output
@@ -2872,6 +2935,8 @@ class GRPOTrainer(_BaseTrainer):
             inputs.get("spatial_shapes"),
             inputs.get("image_sizes"),
             inputs.get("image_position_ids"),
+            inputs.get("pixel_values_videos"),
+            inputs.get("video_position_ids"),
         )
 
         # Apply tool_mask (from env_mask) for loss computation in multi-turn training scenarios
@@ -3015,6 +3080,9 @@ class GRPOTrainer(_BaseTrainer):
             token_type_ids=inputs.get("token_type_ids"),
             mm_token_type_ids=inputs.get("mm_token_type_ids"),
             image_position_ids=inputs.get("image_position_ids"),
+            pixel_values_videos=inputs.get("pixel_values_videos"),
+            video_position_ids=inputs.get("video_position_ids"),
+            num_videos=inputs.get("num_videos"),
         )
 
         if self.top_entropy_quantile < 1.0:

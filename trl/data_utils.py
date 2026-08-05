@@ -30,10 +30,61 @@ DatasetType = TypeVar("DatasetType", Dataset, DatasetDict)
 IterableDatasetType = TypeVar("IterableDatasetType", IterableDataset, IterableDatasetDict)
 
 
-def prepare_multimodal_messages(messages: list[dict[str, Any]], images: list | None = None) -> list[dict[str, Any]]:
+# Keys that transformers' `apply_chat_template` itself accepts as an already-filled media payload (see
+# `ProcessorMixin.apply_chat_template`'s `image_fnames`/`video_fnames` extraction). A block carrying its payload
+# under any of these must be left alone, not miscounted as an empty placeholder awaiting `images=`/`videos=`.
+_MEDIA_PAYLOAD_KEYS = {
+    "image": {"image", "url", "path", "base64"},
+    "video": {"video", "url", "path"},
+}
+
+
+def _fill_multimodal_placeholders(
+    messages: list[dict[str, Any]], media_type: str, media: list
+) -> list[dict[str, Any]]:
+    """Check that unfilled `{"type": media_type}` placeholders in `messages` match `media`, then fill them in."""
+    payload_keys = _MEDIA_PAYLOAD_KEYS[media_type]
+
+    def is_unfilled(part):
+        return part["type"] == media_type and not payload_keys & part.keys()
+
+    num_placeholders = sum(
+        sum(1 for part in message["content"] if is_unfilled(part))
+        for message in messages
+        if message.get("content") and message["role"] != "tool"
+    )
+    if num_placeholders != len(media):
+        raise ValueError(
+            f"Number of {media_type}s provided ({len(media)}) does not match number of {media_type} placeholders "
+            f"({num_placeholders})."
+        )
+    if not media:
+        return messages
+
+    idx = 0
+    new_messages = []
+    for message in messages:
+        if not message.get("content") or message["role"] == "tool":
+            new_messages.append(message)
+            continue
+        new_content = []
+        for part in message["content"]:
+            if is_unfilled(part):
+                new_content.append({**part, media_type: media[idx]})
+                idx += 1
+            else:
+                new_content.append(part)
+        new_messages.append({**message, "content": new_content})
+    return new_messages
+
+
+def prepare_multimodal_messages(
+    messages: list[dict[str, Any]], images: list | None = None, videos: list | None = None
+) -> list[dict[str, Any]]:
     # docstyle-ignore  # because <Image> is not parsable in the code block
     """
-    Convert messages into a structured multimodal format and inject the provided images into the message contents.
+    Convert messages into a structured multimodal format and inject the provided images and videos into the message
+    contents.
 
     Args:
         messages (`list[dict[str, Any]]`):
@@ -43,19 +94,25 @@ def prepare_multimodal_messages(messages: list[dict[str, Any]], images: list | N
             be `None` or not provided in favour of `"tool_calls"` in the `"assistant"` turns if applicable.
         images (`list`, *optional*):
             List of image objects to insert in the messages.
+        videos (`list`, *optional*):
+            List of video objects to insert in the messages.
 
     Returns:
         `list[dict[str, Any]]`: A new list of messages where every `"content"` value is a list of structured
-        content blocks, and all `"image"` placeholders are populated with the corresponding image objects. If the
-        assistant turns contains `"tool_calls"`, then the `"content"` might be empty.
+        content blocks, and all `"image"`/`"video"` placeholders are populated with the corresponding objects. If
+        the assistant turns contains `"tool_calls"`, then the `"content"` might be empty.
 
     Notes:
         - When the input `messages` isn't already in the structured format, (i.e., all `"content"` values are strings),
           the function transforms them into the structured format by wrapping text in `{"type": "text", "text": ...}`
-          and inserting `{"type": "image"}` placeholders for the images *before* the first user message.
-          If the number of placeholders does not match the number of provided images, an error is raised.
-        - Existing image blocks that already include an `"image"` payload are preserved as-is. Only unfilled image
-          placeholders are counted and populated from `images`.
+          and inserting `{"type": "image"}`/`{"type": "video"}` placeholders for the images/videos *before* the first
+          user message. If the number of placeholders does not match the number of provided images/videos, an error
+          is raised.
+        - Existing image/video blocks that already include a payload are preserved as-is. A block counts as already
+          filled if it has any of the keys `transformers.ProcessorMixin.apply_chat_template` itself accepts as a
+          media payload (`"image"`, `"url"`, `"path"`, or `"base64"` for images; `"video"`, `"url"`, or `"path"` for
+          videos), not just the literal `"image"`/`"video"` key. Only unfilled placeholders are counted and
+          populated from `images`/`videos`.
 
     Example:
     ```python
@@ -73,17 +130,20 @@ def prepare_multimodal_messages(messages: list[dict[str, Any]], images: list | N
     ```
     """
     images = images or []
+    videos = videos or []
 
-    # First, convert all messages to the structured format if needed, and insert image placeholders if needed.
+    # First, convert all messages to the structured format if needed, and insert image/video placeholders if needed.
     # Build new message dicts only when transforming string content to avoid modifying the originals.
     new_messages = []
-    images_included = False
+    placeholders_included = False
     for message in messages:
         if message["role"] == "user":
-            if isinstance(message["content"], str) and not images_included:
+            if isinstance(message["content"], str) and not placeholders_included:
                 image_entries = [{"type": "image"} for _ in range(len(images))]
-                message = {**message, "content": [*image_entries, {"type": "text", "text": message["content"]}]}
-                images_included = True
+                video_entries = [{"type": "video"} for _ in range(len(videos))]
+                content = [*image_entries, *video_entries, {"type": "text", "text": message["content"]}]
+                message = {**message, "content": content}
+                placeholders_included = True
             elif isinstance(message["content"], str):
                 message = {**message, "content": [{"type": "text", "text": message["content"]}]}
         elif message["role"] in {"assistant", "system", "tool"}:
@@ -95,31 +155,9 @@ def prepare_multimodal_messages(messages: list[dict[str, Any]], images: list | N
             )
         new_messages.append(message)
 
-    # Then, check that the number of image placeholders matches the number of images provided
-    num_placeholders = sum(
-        sum(1 for part in message["content"] if part["type"] == "image" and "image" not in part)
-        for message in new_messages
-        if message.get("content") and message["role"] != "tool"
-    )
-    if num_placeholders != len(images):
-        raise ValueError(
-            f"Number of images provided ({len(images)}) does not match number of image placeholders ({num_placeholders})."
-        )
-
-    # Then, fill in the actual images in the placeholders
-    if images:
-        img_idx = 0
-        for i, message in enumerate(new_messages):
-            if not message.get("content") or message["role"] == "tool":
-                continue
-            new_content = []
-            for part in message["content"]:
-                if part["type"] == "image" and "image" not in part:
-                    new_content.append({**part, "image": images[img_idx]})
-                    img_idx += 1
-                else:
-                    new_content.append(part)
-            new_messages[i] = {**message, "content": new_content}
+    # Then, check that the number of placeholders matches the number of images/videos provided, and fill them in
+    new_messages = _fill_multimodal_placeholders(new_messages, "image", images)
+    new_messages = _fill_multimodal_placeholders(new_messages, "video", videos)
 
     return new_messages
 
