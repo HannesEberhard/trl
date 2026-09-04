@@ -30,10 +30,16 @@ DatasetType = TypeVar("DatasetType", Dataset, DatasetDict)
 IterableDatasetType = TypeVar("IterableDatasetType", IterableDataset, IterableDatasetDict)
 
 
-def prepare_multimodal_messages(messages: list[dict[str, Any]], images: list | None = None) -> list[dict[str, Any]]:
+def prepare_multimodal_messages(
+    messages: list[dict[str, Any]],
+    images: list | None = None,
+    videos: list | None = None,
+    video_metadata: list | None = None,
+) -> list[dict[str, Any]]:
     # docstyle-ignore  # because <Image> is not parsable in the code block
     """
-    Convert messages into a structured multimodal format and inject the provided images into the message contents.
+    Convert messages into a structured multimodal format and inject the provided images and videos into the message
+    contents.
 
     Args:
         messages (`list[dict[str, Any]]`):
@@ -43,19 +49,25 @@ def prepare_multimodal_messages(messages: list[dict[str, Any]], images: list | N
             be `None` or not provided in favour of `"tool_calls"` in the `"assistant"` turns if applicable.
         images (`list`, *optional*):
             List of image objects to insert in the messages.
+        videos (`list`, *optional*):
+            List of videos to insert in the messages, where each video is a `list` of decoded frames (e.g.
+            `PIL.Image.Image` objects).
+        video_metadata (`list`, *optional*):
+            List of video metadata `dict`s (e.g. `fps`, `total_num_frames`), one per video in `videos`.
 
     Returns:
         `list[dict[str, Any]]`: A new list of messages where every `"content"` value is a list of structured
-        content blocks, and all `"image"` placeholders are populated with the corresponding image objects. If the
-        assistant turns contains `"tool_calls"`, then the `"content"` might be empty.
+        content blocks, and all `"image"`/`"video"` placeholders are populated with the corresponding objects. If
+        the assistant turns contains `"tool_calls"`, then the `"content"` might be empty.
 
     Notes:
         - When the input `messages` isn't already in the structured format, (i.e., all `"content"` values are strings),
           the function transforms them into the structured format by wrapping text in `{"type": "text", "text": ...}`
-          and inserting `{"type": "image"}` placeholders for the images *before* the first user message.
-          If the number of placeholders does not match the number of provided images, an error is raised.
-        - Existing image blocks that already include an `"image"` payload are preserved as-is. Only unfilled image
-          placeholders are counted and populated from `images`.
+          and inserting `{"type": "image"}` placeholders for the images, followed by `{"type": "video"}` placeholders
+          for the videos, *before* the first user message. If the number of placeholders does not match the number
+          of provided images/videos, an error is raised.
+        - Existing image/video blocks that already include an `"image"`/`"video"` payload are preserved as-is. Only
+          unfilled placeholders are counted and populated from `images`/`videos`.
 
     Example:
     ```python
@@ -73,17 +85,23 @@ def prepare_multimodal_messages(messages: list[dict[str, Any]], images: list | N
     ```
     """
     images = images or []
+    videos = videos or []
+    video_metadata = video_metadata or [None] * len(videos)
 
-    # First, convert all messages to the structured format if needed, and insert image placeholders if needed.
+    # First, convert all messages to the structured format if needed, and insert image/video placeholders if needed.
     # Build new message dicts only when transforming string content to avoid modifying the originals.
     new_messages = []
-    images_included = False
+    media_included = False
     for message in messages:
         if message["role"] == "user":
-            if isinstance(message["content"], str) and not images_included:
+            if isinstance(message["content"], str) and not media_included:
                 image_entries = [{"type": "image"} for _ in range(len(images))]
-                message = {**message, "content": [*image_entries, {"type": "text", "text": message["content"]}]}
-                images_included = True
+                video_entries = [{"type": "video"} for _ in range(len(videos))]
+                message = {
+                    **message,
+                    "content": [*image_entries, *video_entries, {"type": "text", "text": message["content"]}],
+                }
+                media_included = True
             elif isinstance(message["content"], str):
                 message = {**message, "content": [{"type": "text", "text": message["content"]}]}
         elif message["role"] in {"assistant", "system", "tool"}:
@@ -95,20 +113,32 @@ def prepare_multimodal_messages(messages: list[dict[str, Any]], images: list | N
             )
         new_messages.append(message)
 
-    # Then, check that the number of image placeholders matches the number of images provided
-    num_placeholders = sum(
+    # Then, check that the number of image/video placeholders matches the number of images/videos provided
+    num_image_placeholders = sum(
         sum(1 for part in message["content"] if part["type"] == "image" and "image" not in part)
         for message in new_messages
         if message.get("content") and message["role"] != "tool"
     )
-    if num_placeholders != len(images):
+    if num_image_placeholders != len(images):
         raise ValueError(
-            f"Number of images provided ({len(images)}) does not match number of image placeholders ({num_placeholders})."
+            f"Number of images provided ({len(images)}) does not match number of image placeholders "
+            f"({num_image_placeholders})."
+        )
+    num_video_placeholders = sum(
+        sum(1 for part in message["content"] if part["type"] == "video" and "video" not in part)
+        for message in new_messages
+        if message.get("content") and message["role"] != "tool"
+    )
+    if num_video_placeholders != len(videos):
+        raise ValueError(
+            f"Number of videos provided ({len(videos)}) does not match number of video placeholders "
+            f"({num_video_placeholders})."
         )
 
-    # Then, fill in the actual images in the placeholders
-    if images:
+    # Then, fill in the actual images/videos in the placeholders
+    if images or videos:
         img_idx = 0
+        vid_idx = 0
         for i, message in enumerate(new_messages):
             if not message.get("content") or message["role"] == "tool":
                 continue
@@ -117,6 +147,9 @@ def prepare_multimodal_messages(messages: list[dict[str, Any]], images: list | N
                 if part["type"] == "image" and "image" not in part:
                     new_content.append({**part, "image": images[img_idx]})
                     img_idx += 1
+                elif part["type"] == "video" and "video" not in part:
+                    new_content.append({**part, "video": videos[vid_idx], "video_metadata": video_metadata[vid_idx]})
+                    vid_idx += 1
                 else:
                     new_content.append(part)
             new_messages[i] = {**message, "content": new_content}
