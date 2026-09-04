@@ -2502,6 +2502,20 @@ class GRPOTrainer(_BaseTrainer):
             tool_images,
         )
 
+    def _maybe_dump_video_debug_tensors(self, tag: str, payload: dict) -> None:
+        """
+        Debug utility, opt-in via the `TRL_DEBUG_VIDEO_DUMP_DIR` env var (no-op otherwise, zero overhead when
+        unset): dumps video-related tensors/objects to disk so they can be loaded and diffed against the vLLM
+        server's own dump (see the matching hook in `trl/scripts/vllm_serve.py`) to verify, on a real training run,
+        that vLLM and the loss-time forward pass see identical pixel data.
+        """
+        dump_dir = os.environ.get("TRL_DEBUG_VIDEO_DUMP_DIR")
+        if not dump_dir:
+            return
+        os.makedirs(dump_dir, exist_ok=True)
+        path = os.path.join(dump_dir, f"{tag}_step{self.state.global_step}_rank{self.accelerator.process_index}.pt")
+        torch.save(payload, path)
+
     def _decode_videos_once(
         self, raw_videos: list[list | None]
     ) -> tuple[list[list[list] | None], list[list[dict] | None]]:
@@ -2821,6 +2835,22 @@ class GRPOTrainer(_BaseTrainer):
             prompt_inputs = self.processing_class(**processor_kwargs)
             prompt_inputs = super()._prepare_inputs(prompt_inputs)
             forward_kwargs = {k: v for k, v in prompt_inputs.items() if k not in ["input_ids", "attention_mask"]}
+            if videos is not None:
+                self._maybe_dump_video_debug_tensors(
+                    "client_loss_forward",
+                    {
+                        "pixel_values_videos": forward_kwargs.get("pixel_values_videos"),
+                        "video_grid_thw": forward_kwargs.get("video_grid_thw"),
+                        "video_position_ids": forward_kwargs.get("video_position_ids"),
+                        "second_per_grid_ts": forward_kwargs.get("second_per_grid_ts"),
+                        # `input_ids` from this re-tokenization of the same prompt text are excluded from
+                        # `forward_kwargs` below (the actual loss forward pass reuses the original generation-time
+                        # `prompt_ids` instead) — dumped here only so it can be diffed against what was sent to
+                        # vLLM, as a consistency check on the chat-template rendering itself.
+                        "input_ids": prompt_inputs.get("input_ids"),
+                        "attention_mask": prompt_inputs.get("attention_mask"),
+                    },
+                )
         else:
             forward_kwargs = {}
 

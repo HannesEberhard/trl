@@ -1055,8 +1055,14 @@ class TestVLLMClientServerVideo(TrlTestCase):
 
     @classmethod
     def setup_class(cls):
+        import tempfile
+
+        cls.debug_dump_dir = tempfile.mkdtemp(prefix="trl_video_debug_")
+        # Set on the server subprocess so `vllm_serve.py`'s debug hook dumps the exact (frames, metadata) it
+        # hands to vLLM, letting this test verify the server reconstructed what the client actually sent.
+        env = dict(os.environ, TRL_DEBUG_VIDEO_DUMP_DIR=cls.debug_dump_dir)
         cls.server_process = subprocess.Popen(
-            ["trl", "vllm-serve", "--model", cls.model_id], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            ["trl", "vllm-serve", "--model", cls.model_id], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
         )
         cls.client = VLLMClient(connection_timeout=240, host="localhost")
 
@@ -1090,6 +1096,20 @@ class TestVLLMClientServerVideo(TrlTestCase):
         assert len(completion_ids) == 1
         assert all(isinstance(tok, int) for tok in prompt_ids[0])
         assert all(isinstance(tok, int) for tok in completion_ids[0])
+
+        # Verify the server-side debug dump round-tripped the exact frames/metadata the client sent (proves the
+        # base64-PNG serialization is lossless and the server reconstructed the (frames, metadata) tuple format
+        # vLLM's video bypass path expects — see the `TRL_DEBUG_VIDEO_DUMP_DIR` hook in `trl/scripts/vllm_serve.py`).
+        import torch
+
+        dump_files = [f for f in os.listdir(self.debug_dump_dir) if f.startswith("server_generate_request_")]
+        assert len(dump_files) >= 1, f"Expected a debug dump in {self.debug_dump_dir}, found none."
+        dumped = torch.load(os.path.join(self.debug_dump_dir, sorted(dump_files)[-1]), weights_only=False)
+        dumped_frames, dumped_metadata = dumped[0][0]
+        assert len(dumped_frames) == len(frames)
+        for original_frame, dumped_frame in zip(frames, dumped_frames, strict=True):
+            assert list(original_frame.getdata()) == list(dumped_frame.getdata())
+        assert dumped_metadata["total_num_frames"] == video_metadata["total_num_frames"]
 
     def test_generate_with_token_ids_video_and_image(self):
         """Test a batch mixing a video-only prompt and an image-only prompt."""
@@ -1137,6 +1157,9 @@ class TestVLLMClientServerVideo(TrlTestCase):
     @classmethod
     def teardown_class(cls):
         kill_process(cls.server_process)
+        import shutil
+
+        shutil.rmtree(cls.debug_dump_dir, ignore_errors=True)
 
 
 @require_vllm

@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import os
+import time
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -632,6 +633,20 @@ def main(script_args: ScriptArguments):
             if mm_data:
                 row["multi_modal_data"] = mm_data
             prompts.append(row)
+
+        # Debug utility, opt-in via the `TRL_DEBUG_VIDEO_DUMP_DIR` env var (no-op otherwise): dumps the exact
+        # (frames, metadata) handed to vLLM, so it can be loaded and diffed against the trainer-side dumps (see
+        # `GRPOTrainer._maybe_dump_video_debug_tensors`) to verify both sides see identical pixel data.
+        dump_dir = os.environ.get("TRL_DEBUG_VIDEO_DUMP_DIR")
+        if dump_dir and any(row.get("multi_modal_data", {}).get("video") is not None for row in prompts):
+            import torch
+
+            os.makedirs(dump_dir, exist_ok=True)
+            path = os.path.join(dump_dir, f"server_generate_request_{time.time_ns()}.pt")
+            torch.save(
+                [row["multi_modal_data"]["video"] for row in prompts if "video" in row.get("multi_modal_data", {})],
+                path,
+            )
 
         generation_kwargs = {
             "n": request.n,

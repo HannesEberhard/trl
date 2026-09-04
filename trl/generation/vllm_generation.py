@@ -590,6 +590,27 @@ class VLLMGeneration:
                     "structured_outputs_regex": self.structured_outputs_regex,
                     "generation_kwargs": self.generation_kwargs,
                 }
+                # Debug utility, opt-in via `TRL_DEBUG_VIDEO_DUMP_DIR` (no-op otherwise): dumps the exact,
+                # already-deduplicated video payload about to be sent to the vLLM server, so it can be diffed
+                # against the server's own dump of what it received (see `trl/scripts/vllm_serve.py`). Dumping
+                # here (rather than the trainer's pre-deduplication `videos`) is deliberate: `ordered_set_of_videos`
+                # is what actually gets serialized onto the wire, one-to-one with the server's dump.
+                dump_dir = os.environ.get("TRL_DEBUG_VIDEO_DUMP_DIR")
+                if dump_dir and ordered_set_of_videos is not None:
+                    import time
+
+                    os.makedirs(dump_dir, exist_ok=True)
+                    path = os.path.join(dump_dir, f"client_rollout_request_{time.time_ns()}.pt")
+                    torch.save(
+                        {
+                            "videos": ordered_set_of_videos,
+                            "video_metadata": ordered_set_of_video_metadata,
+                            # The exact token IDs sent to vLLM as `prompts=...` below — lets the dump be compared
+                            # against whatever the loss-time re-tokenization of the same prompt produces.
+                            "prompt_ids": ordered_set_of_prompt_ids,
+                        },
+                        path,
+                    )
                 with profiler:
                     output = self.vllm_client.generate(
                         prompts=ordered_set_of_prompt_ids,
