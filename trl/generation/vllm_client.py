@@ -422,6 +422,16 @@ class VLLMClient:
                 Device of trainer main process. It's the device that will be used for the weights synchronization. Can
                 be a `torch.device` object, a string like `'cuda:0'`, or an integer device index.
         """
+        # Normalize to an explicit device index. A bare `torch.device("cuda")` (no index — e.g. what
+        # `accelerator.device` can resolve to) is stored as-is by `PyNcclCommunicator`, but PyTorch resolves an
+        # index-less device to a concrete index only once a tensor is actually allocated on it. That mismatch
+        # makes `PyNcclCommunicator`'s own internal self-test tensor compare unequal to the unindexed device it
+        # stored, failing with a false "wrong device" assertion. Resolving the index here avoids that.
+        if not is_torch_xpu_available():
+            device = torch.device(device) if not isinstance(device, torch.device) else device
+            if device.type == "cuda" and device.index is None:
+                device = torch.device("cuda", torch.cuda.current_device())
+
         # Get the world size from the server
         url = f"{self.base_url}/get_world_size/"
         response = requests.get(url)
