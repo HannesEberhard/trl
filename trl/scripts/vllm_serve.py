@@ -360,6 +360,12 @@ def llm_worker(
         # Important so temperature scaling/logit tweaking affects the TIS log probs
         logprobs_mode="processed_logprobs",
         speculative_config=json.loads(script_args.speculative_config) if script_args.speculative_config else None,
+        # Video frames are already decoded and frame-sampled once, client-side (see GRPOTrainer._decode_videos_once),
+        # so vLLM's own video processor must not re-sample them. Without this, models whose video processor defaults
+        # to `do_sample_frames=True` (e.g. Gemma4) would re-sample the already-sampled frame list using stale
+        # metadata, causing the pixel values vLLM sees to diverge from (or crash instead of matching) those computed
+        # at loss time. Harmless no-op for image-only/text-only serving.
+        mm_processor_kwargs={"do_sample_frames": False},
     )
 
     # Send ready signal to parent process
@@ -513,6 +519,8 @@ def main(script_args: ScriptArguments):
     class GenerateRequest(BaseModel):
         prompts: list[str] | list[list[int]]
         images: list[list[str] | None] | None = None
+        videos: list[list[list[str]] | None] | None = None
+        video_metadata: list[list[dict] | None] | None = None
         n: int = 1
         repetition_penalty: float = 1.0
         temperature: float = 1.0
@@ -541,6 +549,11 @@ def main(script_args: ScriptArguments):
                   or pre-tokenized token ID lists. When text strings are provided, `images` can optionally be included.
                 - `images` (list of list of `str` or `None`, *optional*): A list of image lists. Each element is a list
                   of base64-encoded images for the corresponding prompt, or `None` if no images for that prompt.
+                - `videos` (list of list of list of `str` or `None`, *optional*): A list of video lists. Each element
+                  is a list of videos for the corresponding prompt, where each video is a list of base64-encoded,
+                  already frame-sampled frames, or `None` if no videos for that prompt.
+                - `video_metadata` (list of list of `dict` or `None`, *optional*): A list of video metadata dict
+                  lists, parallel to `videos`.
                 - `n` (`int`, *optional*, defaults to `1`): Number of completions to generate for each prompt.
                 - `repetition_penalty` (`float`, *optional*, defaults to `1.0`): Repetition penalty to apply during
                   generation.
@@ -595,12 +608,29 @@ def main(script_args: ScriptArguments):
         # Build vLLM-compatible prompt inputs
         is_token_ids = request.prompts and isinstance(request.prompts[0], list)
         request.images = request.images or [None] * len(request.prompts)
+        request.videos = request.videos or [None] * len(request.prompts)
+        request.video_metadata = request.video_metadata or [None] * len(request.prompts)
 
         prompts = []
-        for prompt, image_list in zip(request.prompts, request.images, strict=True):
+        for prompt, image_list, video_list, video_meta_list in zip(
+            request.prompts, request.images, request.videos, request.video_metadata, strict=True
+        ):
             row = {"prompt_token_ids": prompt} if is_token_ids else {"prompt": prompt}
+            mm_data = {}
             if image_list is not None:
-                row["multi_modal_data"] = {"image": [Image.open(BytesIO(base64.b64decode(img))) for img in image_list]}
+                mm_data["image"] = [Image.open(BytesIO(base64.b64decode(img))) for img in image_list]
+            if video_list is not None:
+                video_meta_list = video_meta_list or [{}] * len(video_list)
+                # Frames were already decoded/frame-sampled once, client-side (see
+                # GRPOTrainer._decode_videos_once); passing already-decoded frames here (rather than a raw
+                # file/URL/bytes) makes vLLM skip its own, independent video decoding/sampling entirely and go
+                # straight to the same `transformers` pixel-value computation used at loss time.
+                mm_data["video"] = [
+                    ([Image.open(BytesIO(base64.b64decode(frame))) for frame in video_frames], video_meta)
+                    for video_frames, video_meta in zip(video_list, video_meta_list, strict=True)
+                ]
+            if mm_data:
+                row["multi_modal_data"] = mm_data
             prompts.append(row)
 
         generation_kwargs = {

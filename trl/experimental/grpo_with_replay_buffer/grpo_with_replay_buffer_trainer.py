@@ -150,6 +150,8 @@ class GRPOWithReplayBufferTrainer(GRPOTrainer):
             sampling_per_token_logps_list,
             extra_fields,
             images,
+            _,  # videos: not supported by this experimental trainer
+            _,  # video_metadata: not supported by this experimental trainer
             tool_images,
         ) = self._generate(prompts)
         if images is None:

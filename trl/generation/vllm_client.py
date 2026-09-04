@@ -205,6 +205,8 @@ class VLLMClient:
         self,
         prompts: list[str] | list[list[int]],
         images: list | None = None,
+        videos: list | None = None,
+        video_metadata: list | None = None,
         n: int = 1,
         repetition_penalty: float = 1.0,
         temperature: float = 1.0,
@@ -225,6 +227,12 @@ class VLLMClient:
             images (`list[list[PIL.Image] | None]`, *optional*):
                 List of image lists for VLM support. Each element is a list of PIL images for the corresponding prompt,
                 or `None` if no images for that prompt.
+            videos (`list[list[list[PIL.Image]] | None]`, *optional*):
+                List of video lists for VLM support. Each element is a list of videos for the corresponding prompt
+                (each video itself a list of already decoded/frame-sampled PIL frames), or `None` if no videos for
+                that prompt.
+            video_metadata (`list[list[dict] | None]`, *optional*):
+                List of video metadata dict lists, parallel to `videos`.
             n (`int`, *optional*, defaults to `1`):
                 Number of completions to generate for each prompt.
             repetition_penalty (`float`, *optional*, defaults to `1.0`):
@@ -271,11 +279,22 @@ class VLLMClient:
                 [pil_to_base64(img) for img in img_list] if img_list is not None else None for img_list in images
             ]
 
+        # Same base64-PNG (lossless) encoding as images, one level deeper: each video is a list of frames.
+        if videos:
+            videos = [
+                [[pil_to_base64(frame) for frame in video] for video in video_list]
+                if video_list is not None
+                else None
+                for video_list in videos
+            ]
+
         response = self.session.post(
             url,
             json={
                 "prompts": prompts,
                 "images": images,
+                "videos": videos,
+                "video_metadata": video_metadata,
                 "n": n,
                 "repetition_penalty": repetition_penalty,
                 "temperature": temperature,

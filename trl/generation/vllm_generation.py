@@ -508,6 +508,8 @@ class VLLMGeneration:
         prompts: list[list[int]],
         images: list[list | None] | None,
         num_generations: int,
+        videos: list[list[list] | None] | None = None,
+        video_metadata: list[list[dict] | None] | None = None,
         profiler: ProfilingContext | None = None,
     ) -> tuple:
         """Generate completions using vLLM.
@@ -517,6 +519,10 @@ class VLLMGeneration:
             images: Optional list of image lists for VLM support. Each element is a list of PIL images for the
                 corresponding prompt, or `None` if no images for that prompt. `None` if no images at all.
             num_generations: Number of generations per prompt.
+            videos: Optional list of video lists for VLM support (server mode only). Each element is a list of
+                already decoded/frame-sampled videos (each a list of PIL frames) for the corresponding prompt, or
+                `None` if no videos for that prompt. `None` if no videos at all.
+            video_metadata: Optional list of video metadata dict lists, parallel to `videos`.
             profiler: Optional profiler for performance tracking.
 
         Returns:
@@ -553,6 +559,13 @@ class VLLMGeneration:
             all_images = gather_object(images if images is not None else [None] * len(prompts))
             if all(img is None for img in all_images):
                 all_images = None
+            # Same collective-gather-even-when-None rationale as images above.
+            all_videos = gather_object(videos if videos is not None else [None] * len(prompts))
+            if all(v is None for v in all_videos):
+                all_videos = None
+            all_video_metadata = gather_object(video_metadata if video_metadata is not None else [None] * len(prompts))
+            if all(m is None for m in all_video_metadata):
+                all_video_metadata = None
 
             if accelerator.is_main_process:
                 # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and
@@ -560,6 +573,10 @@ class VLLMGeneration:
                 # duplicate prompt individually.
                 ordered_set_of_prompt_ids = all_prompts[::num_generations]
                 ordered_set_of_images = all_images[::num_generations] if all_images is not None else None
+                ordered_set_of_videos = all_videos[::num_generations] if all_videos is not None else None
+                ordered_set_of_video_metadata = (
+                    all_video_metadata[::num_generations] if all_video_metadata is not None else None
+                )
 
                 sampling_params = {
                     "n": num_generations,
@@ -577,6 +594,8 @@ class VLLMGeneration:
                     output = self.vllm_client.generate(
                         prompts=ordered_set_of_prompt_ids,
                         images=ordered_set_of_images,
+                        videos=ordered_set_of_videos,
+                        video_metadata=ordered_set_of_video_metadata,
                         **sampling_params,
                     )
                     payload = (
@@ -608,6 +627,10 @@ class VLLMGeneration:
 
         # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
         elif self.mode == "colocate":
+            if videos is not None:
+                raise NotImplementedError(
+                    "Video inputs are only supported with `vllm_mode='server'`, not `vllm_mode='colocate'`."
+                )
             generation_kwargs = {
                 "n": 1,  # vLLM on each GPU generates only 1 in colocate mode
                 "repetition_penalty": repetition_penalty,
