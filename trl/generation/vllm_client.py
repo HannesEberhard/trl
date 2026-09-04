@@ -525,6 +525,20 @@ class VLLMClient:
             weights (`torch.Tensor`):
                 Tensor containing the updated weights.
         """
+        GEMMA4_HF_TO_VLLM = [
+            ("embed_vision.patch_ln1", "vision_embedder.patch_ln1"),
+            ("embed_vision.patch_dense", "vision_embedder.patch_dense"),
+            ("embed_vision.patch_ln2", "vision_embedder.patch_ln2"),
+            ("embed_vision.pos_embedding", "vision_embedder.pos_embedding"),
+            ("embed_vision.pos_norm", "vision_embedder.pos_norm"),
+            ("embed_vision.multimodal_embedder.embedding_projection", "embed_vision.embedding_projection"),
+        ]
+
+        for hf_pattern, vllm_target in GEMMA4_HF_TO_VLLM:
+            if hf_pattern in name:
+                name = name.replace(hf_pattern, vllm_target)
+                break
+
         dtype, shape = str(weights.dtype), tuple(weights.shape)
         url = f"{self.base_url}/update_named_param/"
         response = self.session.post(url, json={"name": name, "dtype": dtype, "shape": shape})
