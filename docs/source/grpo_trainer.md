@@ -1031,6 +1031,10 @@ Each training sample should include:
 
 The trainer automatically handles image-to-tensor conversion via the model’s image processor.
 
+### Video Support
+
+GRPO also supports training on video inputs, for any model whose processor exposes a `video_processor` (e.g. Qwen2-VL, Qwen2.5-VL, Gemma4), when `use_vllm=True` and `vllm_mode="server"` (`vllm_mode="colocate"` does not support video). Add a `video`/`videos` column to the dataset, alongside or instead of `image`/`images`: each value can be a local file path, an `http(s)://` URL, or a `data:video/<subtype>;base64,<payload>` data URL. The video is decoded and frame-sampled once, and the exact same frames are then used both for vLLM's rollout generation and for the loss-time forward pass, so the two are guaranteed to see identical pixel data.
+
 ## GRPOTrainer
 
 [[autodoc]] GRPOTrainer

@@ -17,6 +17,8 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
+import torch
+import transformers
 from packaging.version import Version
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 from transformers.testing_utils import torch_device
@@ -39,6 +41,8 @@ from .testing_utils import (
 if is_vllm_available():
     import vllm
     from vllm import LLM, SamplingParams
+    from vllm.config import ModelConfig
+    from vllm.multimodal import MULTIMODAL_REGISTRY
 
     _is_vllm_ge_014 = Version(vllm.__version__) >= Version("0.14.0")
 else:
@@ -1034,3 +1038,205 @@ class TestVLLMClientServerVLM(TrlTestCase):
     @classmethod
     def teardown_class(cls):
         kill_process(cls.server_process)
+
+
+@pytest.mark.slow
+@require_vllm
+@require_vision
+class TestVLLMClientServerVideo(TrlTestCase):
+    """
+    Live end-to-end test: a real `trl vllm-serve` subprocess serving a real video-capable model. Complements
+    `TestVideoPreprocessingConsistency` (which proves the two preprocessing code paths are equivalent in-process,
+    without a live server) by exercising the actual HTTP request/response and base64 frame round-trip that
+    `GRPOTrainer`'s server-mode rollout path relies on.
+    """
+
+    model_id = "Qwen/Qwen2.5-VL-3B-Instruct"
+
+    @classmethod
+    def setup_class(cls):
+        cls.server_process = subprocess.Popen(
+            ["trl", "vllm-serve", "--model", cls.model_id], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        cls.client = VLLMClient(connection_timeout=240, host="localhost")
+
+    def test_generate_with_token_ids_and_video(self):
+        from PIL import Image
+
+        processor = AutoProcessor.from_pretrained(self.model_id)
+        frames = [Image.new("RGB", (64, 64), color=(i * 40 % 256, 0, 0)) for i in range(4)]
+        video_metadata = {"total_num_frames": 4, "fps": 2.0, "duration": 2.0, "frames_indices": [0, 1, 2, 3]}
+        messages = [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video", "video": frames, "video_metadata": video_metadata},
+                        {"type": "text", "text": "Describe this video."},
+                    ],
+                }
+            ]
+        ]
+        prompt_token_ids = processor.apply_chat_template(
+            conversation=messages, tokenize=True, add_generation_prompt=True
+        )
+        outputs = self.client.generate(
+            prompt_token_ids, videos=[[frames]], video_metadata=[[video_metadata]], max_tokens=32
+        )
+        prompt_ids = outputs["prompt_ids"]
+        completion_ids = outputs["completion_ids"]
+
+        assert len(prompt_ids) == 1
+        assert len(completion_ids) == 1
+        assert all(isinstance(tok, int) for tok in prompt_ids[0])
+        assert all(isinstance(tok, int) for tok in completion_ids[0])
+
+    def test_generate_with_token_ids_video_and_image(self):
+        """Test a batch mixing a video-only prompt and an image-only prompt."""
+        from PIL import Image
+
+        processor = AutoProcessor.from_pretrained(self.model_id)
+        image = Image.new("RGB", (64, 64), color="blue")
+        frames = [Image.new("RGB", (64, 64), color=(i * 40 % 256, 0, 0)) for i in range(4)]
+        video_metadata = {"total_num_frames": 4, "fps": 2.0, "duration": 2.0, "frames_indices": [0, 1, 2, 3]}
+        messages = [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video", "video": frames, "video_metadata": video_metadata},
+                        {"type": "text", "text": "Describe this video."},
+                    ],
+                }
+            ],
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": image}, {"type": "text", "text": "Describe this image."}],
+                }
+            ],
+        ]
+        prompt_token_ids = processor.apply_chat_template(
+            conversation=messages, tokenize=True, add_generation_prompt=True
+        )
+        outputs = self.client.generate(
+            prompt_token_ids,
+            images=[None, [image]],
+            videos=[[frames], None],
+            video_metadata=[[video_metadata], None],
+            max_tokens=32,
+        )
+        prompt_ids = outputs["prompt_ids"]
+        completion_ids = outputs["completion_ids"]
+
+        assert len(prompt_ids) == 2
+        assert len(completion_ids) == 2
+        assert all(isinstance(tok, int) for tok in prompt_ids[0])
+        assert all(isinstance(tok, int) for tok in prompt_ids[1])
+
+    @classmethod
+    def teardown_class(cls):
+        kill_process(cls.server_process)
+
+
+@require_vllm
+@require_vision
+class TestVideoPreprocessingConsistency(TrlTestCase):
+    """
+    Verifies that the video pixel values vLLM computes for rollout generation and the video pixel values
+    `transformers` computes for loss computation are bit-identical when given the same already-decoded frames.
+
+    This is the correctness guarantee `GRPOTrainer._decode_videos_once` relies on: both `VLLMGeneration.generate`
+    (server mode, via `vllm_serve.py`) and the loss-time `self.processing_class(videos=..., do_sample_frames=False,
+    ...)` call ultimately run the exact same installed `transformers` preprocessing code on the exact same frames.
+    `MULTIMODAL_REGISTRY.create_processor` builds vLLM's multimodal processor from just a `ModelConfig` (no engine,
+    no weights, no GPU), so this can be verified deterministically without a live vLLM server.
+    """
+
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "trl-internal-testing/tiny-Qwen2VLForConditionalGeneration",
+            pytest.param(
+                "trl-internal-testing/tiny-Gemma4ForConditionalGeneration",
+                marks=pytest.mark.skipif(
+                    Version(transformers.__version__) < Version("5.5.0"),
+                    reason="Gemma4 models were introduced in transformers-5.5.0",
+                ),
+            ),
+        ],
+    )
+    def test_pixel_values_videos_match_between_transformers_and_vllm(self, model_id):
+        from PIL import Image
+
+        processor = AutoProcessor.from_pretrained(model_id)
+
+        # Synthetic already-decoded video: exactly the canonical representation `GRPOTrainer._decode_videos_once`
+        # produces (a list of PIL frames + a metadata dict), which is what's sent, unchanged, to both vLLM and the
+        # loss-time processor call.
+        frames = [Image.new("RGB", (32, 32), color=(i * 60 % 256, 0, 0)) for i in range(4)]
+        metadata = {"total_num_frames": 4, "fps": 2.0, "duration": 2.0, "frames_indices": [0, 1, 2, 3]}
+        text = processor.apply_chat_template(
+            [{"role": "user", "content": [{"type": "video"}, {"type": "text", "text": "Describe this video."}]}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        # Path A: what GRPOTrainer's own loss-time forward pass computes (grpo_trainer.py's
+        # `self.processing_class(videos=..., video_metadata=..., do_sample_frames=False, ...)` call).
+        transformers_side = processor(
+            videos=[frames], video_metadata=[metadata], do_sample_frames=False, text=[text], return_tensors="pt"
+        )
+
+        # Path B: what vLLM computes internally for rollout generation. `mm_processor_kwargs` mirrors the
+        # `LLM(mm_processor_kwargs={"do_sample_frames": False}, ...)` construction in `trl/scripts/vllm_serve.py`,
+        # so this exercises the same configuration a real server would use — without needing one.
+        model_config = ModelConfig(model=model_id, mm_processor_kwargs={"do_sample_frames": False})
+        vllm_processor = MULTIMODAL_REGISTRY.create_processor(model_config)
+        hf_processor = vllm_processor.info.get_hf_processor()
+        vllm_side = vllm_processor.info.ctx.call_hf_processor(
+            hf_processor, data={"videos": [frames], "video_metadata": [metadata], "text": [text]}
+        )
+
+        # vLLM's `call_hf_processor` casts floating tensors to `model_config.dtype` as a post-processing step (so
+        # the multimodal inputs land in the same dtype the model itself runs in) — real, expected behavior, not a
+        # divergence. Cast before comparing so the assertion targets the actual preprocessing math, not this cast.
+        transformers_pixel_values_videos = transformers_side["pixel_values_videos"].to(
+            vllm_side["pixel_values_videos"].dtype
+        )
+        assert torch.equal(transformers_pixel_values_videos, vllm_side["pixel_values_videos"])
+        video_grid_key = "video_grid_thw" if "video_grid_thw" in transformers_side else "video_position_ids"
+        assert torch.equal(transformers_side[video_grid_key], vllm_side[video_grid_key])
+
+    def test_omitting_do_sample_frames_false_diverges(self):
+        """
+        Regression guard for the bug this design guards against: Gemma4's video processor defaults to
+        `do_sample_frames=True`, so an already-sampled, short frame list handed to it *without* explicitly
+        overriding `do_sample_frames=False` gets an attempted re-sample instead of being used as-is — exactly the
+        divergence `do_sample_frames=False` (on both the loss-time call and `vllm_serve.py`'s `mm_processor_kwargs`)
+        is built to prevent.
+        """
+        if Version(transformers.__version__) < Version("5.5.0"):
+            pytest.skip("Gemma4 models were introduced in transformers-5.5.0")
+        from PIL import Image
+
+        model_id = "trl-internal-testing/tiny-Gemma4ForConditionalGeneration"
+        processor = AutoProcessor.from_pretrained(model_id)
+
+        # A video already decoded and heavily pre-sampled down to a handful of frames out of a much longer
+        # original video, exactly as `GRPOTrainer._decode_videos_once` would produce.
+        frames = [Image.new("RGB", (32, 32), color="red") for _ in range(4)]
+        metadata = {"total_num_frames": 100, "fps": 25.0, "duration": 4.0, "frames_indices": list(range(0, 100, 25))}
+        text = processor.apply_chat_template(
+            [{"role": "user", "content": [{"type": "video"}, {"type": "text", "text": "Describe this video."}]}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        # Correct: do_sample_frames=False reuses the 4 already-sampled frames unchanged.
+        processor(videos=[frames], video_metadata=[metadata], do_sample_frames=False, text=[text], return_tensors="pt")
+
+        # Buggy: without the override, Gemma4's `do_sample_frames=True` default kicks in, and the processor
+        # refuses to re-sample from an already-decoded list of frames.
+        with pytest.raises(Exception):
+            processor(videos=[frames], video_metadata=[metadata], text=[text], return_tensors="pt")

@@ -14,6 +14,7 @@
 
 import asyncio
 import atexit
+import base64
 import copy
 import importlib.resources as pkg_resources
 import inspect
@@ -21,6 +22,7 @@ import json
 import math
 import os
 import sys
+import tempfile
 import textwrap
 import time
 import warnings
@@ -1214,7 +1216,7 @@ class GRPOTrainer(_BaseTrainer):
         # and "attention_mask"). In GRPOTrainer, we preprocess data, so using the model's signature columns doesn't
         # work. Instead, we set them to the columns expected by the `training_step` method, hence the override.
         if self._signature_columns is None:
-            self._signature_columns = ["prompt", "image", "images"]
+            self._signature_columns = ["prompt", "image", "images", "video", "videos"]
 
     # This method overrides `Trainer.get_train_dataloader` to support our custom batching strategy.
     # Instead of returning a standard per-step batch (i.e., `per_device_batch_size), our dataloader loads an
@@ -1358,6 +1360,10 @@ class GRPOTrainer(_BaseTrainer):
         spatial_shapes=None,
         image_sizes=None,
         image_position_ids=None,
+        pixel_values_videos=None,
+        video_grid_thw=None,
+        video_position_ids=None,
+        second_per_grid_ts=None,
     ):
         if is_peft_model(unwrapped_model):
             unwrapped_model = unwrapped_model.base_model.model
@@ -1382,6 +1388,17 @@ class GRPOTrainer(_BaseTrainer):
             model_inputs["image_sizes"] = image_sizes
         if image_position_ids is not None:
             model_inputs["image_position_ids"] = image_position_ids
+        # For Qwen video models:
+        if video_grid_thw is not None and pixel_values_videos is not None:
+            model_inputs["video_grid_thw"] = video_grid_thw
+        # For Gemma4 video models:
+        if pixel_values_videos is not None:
+            model_inputs["pixel_values_videos"] = pixel_values_videos
+        if video_position_ids is not None:
+            model_inputs["video_position_ids"] = video_position_ids
+        # For Qwen2.5-VL video models
+        if second_per_grid_ts is not None:
+            model_inputs["second_per_grid_ts"] = second_per_grid_ts
 
         # Only add logits_to_keep if the model supports it
         if "logits_to_keep" in self.model_kwarg_keys:
@@ -1464,6 +1481,11 @@ class GRPOTrainer(_BaseTrainer):
         token_type_ids=None,
         mm_token_type_ids=None,
         image_position_ids=None,
+        pixel_values_videos=None,
+        video_grid_thw=None,
+        num_videos=None,
+        video_position_ids=None,
+        second_per_grid_ts=None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Compute log-probs, (optionally) entropies, and (optionally) the MoE load-balancing aux loss."""
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
@@ -1500,6 +1522,27 @@ class GRPOTrainer(_BaseTrainer):
                 model_inputs["spatial_shapes"] = spatial_shapes[tile_start:tile_end]
             elif pixel_values is not None:
                 model_inputs["pixel_values"] = pixel_values[start : start + batch_size]
+            # Independent of the image branches above: a batch can contain both images and videos, each with its
+            # own per-sample counts, so video tensors are sliced using their own `num_videos` boundaries.
+            if video_grid_thw is not None and pixel_values_videos is not None:
+                rows_per_video = video_grid_thw.prod(dim=-1)
+                rows_per_sample = torch.split(rows_per_video, num_videos)
+                rows_per_sample = torch.stack([s.sum() for s in rows_per_sample])
+                cum_rows = torch.cat([torch.tensor([0], device=rows_per_sample.device), rows_per_sample.cumsum(0)])
+                row_start, row_end = cum_rows[start].item(), cum_rows[start + batch_size].item()
+                model_inputs["pixel_values_videos"] = pixel_values_videos[row_start:row_end]
+                cum_vids = torch.tensor([0] + num_videos).cumsum(0)
+                vid_start, vid_end = cum_vids[start], cum_vids[start + batch_size]
+                model_inputs["video_grid_thw"] = video_grid_thw[vid_start:vid_end]
+                if second_per_grid_ts is not None:
+                    model_inputs["second_per_grid_ts"] = second_per_grid_ts[vid_start:vid_end]
+            elif video_position_ids is not None and pixel_values_videos is not None:
+                cum_vids = torch.tensor([0] + num_videos).cumsum(0)
+                vid_start, vid_end = cum_vids[start], cum_vids[start + batch_size]
+                model_inputs["pixel_values_videos"] = pixel_values_videos[vid_start:vid_end]
+                model_inputs["video_position_ids"] = video_position_ids[vid_start:vid_end]
+            elif pixel_values_videos is not None:
+                model_inputs["pixel_values_videos"] = pixel_values_videos[start : start + batch_size]
             if pixel_attention_mask is not None and spatial_shapes is None:
                 model_inputs["pixel_attention_mask"] = pixel_attention_mask[start : start + batch_size]
             if image_sizes is not None:
@@ -1748,11 +1791,83 @@ class GRPOTrainer(_BaseTrainer):
                 images.append(prompt_images if prompt_images else None)
             images = images if has_images else None
 
+            # Extract videos (and their metadata) from messages for VLM support, mirroring the image extraction
+            # above. The frames were already decoded/sampled once in `_decode_videos_once`; nothing here re-decodes.
+            videos = []
+            video_metadata = []
+            has_videos = False
+            for prompt in prompts:
+                prompt_videos = []
+                prompt_video_metadata = []
+                for message in prompt:
+                    if isinstance(message["content"], list):
+                        for part in message["content"]:
+                            if part["type"] == "video":
+                                prompt_videos.append(part["video"])
+                                prompt_video_metadata.append(part.get("video_metadata"))
+                                has_videos = True
+                videos.append(prompt_videos if prompt_videos else None)
+                video_metadata.append(prompt_video_metadata if prompt_video_metadata else None)
+            videos = videos if has_videos else None
+            video_metadata = video_metadata if has_videos else None
+
+            # `apply_chat_template`'s own message-content-block extraction only pulls out the `"video"` key, never
+            # `"video_metadata"` (see transformers `ProcessorMixin.apply_chat_template`) — so for models that need
+            # per-frame timestamps to render the prompt text (e.g. Gemma4Unified), it must be passed explicitly via
+            # `processor_kwargs`, matching `apply_chat_template`'s own `videos`/`batch_videos` batching (a `[]` per
+            # prompt without video, never `None`). `do_sample_frames=False` is required alongside it: `metadata`
+            # carries the *original* (pre-`_decode_videos_once`-sampling) `total_num_frames`, so without this,
+            # processors that default to `do_sample_frames=True` (e.g. Gemma4) would try to re-sample against that
+            # larger original count from the already-sampled (shorter) frame list, indexing out of bounds.
+            video_metadata_kwargs = (
+                {
+                    "processor_kwargs": {
+                        "video_metadata": [m or [] for m in video_metadata],
+                        "do_sample_frames": False,
+                    }
+                }
+                if has_videos
+                else {}
+            )
+
+            def _build_vllm_video_prompt_ids(convs, tools):
+                # Render WITHOUT the model-specific processor call (`tokenize=False`), so video/image
+                # placeholders stay collapsed to a single token per item, matching what vLLM's own
+                # multimodal pipeline expects: it does its own expansion internally (using the real
+                # frames it receives separately via `videos`/`video_metadata`), and its placeholder-
+                # matching machinery is built to find and expand exactly one such token per item. Sending
+                # vLLM an *already* fully-expanded prompt (as `prompt_ids` below is, since `tokenize=True`
+                # does run the full processor and its own placeholder expansion) causes vLLM to re-match
+                # and re-expand it, corrupting the sequence (see VIDEO_SUPPORT_HANDOFF.md's "remaining
+                # issue" section for the diagnosis). `prompt_ids` itself is left untouched and is still
+                # what's used for the loss-time forward pass.
+                text = self.processing_class.apply_chat_template(
+                    conversation=convs,
+                    tools=tools,
+                    chat_template=self.chat_template,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                    **self.chat_template_kwargs,
+                )
+                tokenizer = getattr(self.processing_class, "tokenizer", self.processing_class)
+                add_special_tokens = not (tokenizer.bos_token is not None and text[0].startswith(tokenizer.bos_token))
+                return [tokenizer(t, add_special_tokens=add_special_tokens)["input_ids"] for t in text]
+
             if self.environment_factories is not None:
                 # Tools differ per example across environments, so render each prompt with its own tool schema.
                 prompt_ids = []
                 multimodal_fields = {}
-                for prompt, name in zip(prompts, self._batch_environments, strict=True):
+                for idx, (prompt, name) in enumerate(zip(prompts, self._batch_environments, strict=True)):
+                    per_prompt_video_metadata_kwargs = (
+                        {
+                            "processor_kwargs": {
+                                "video_metadata": [video_metadata[idx] or []],
+                                "do_sample_frames": False,
+                            }
+                        }
+                        if has_videos
+                        else {}
+                    )
                     tokenized = self.processing_class.apply_chat_template(
                         conversation=[prompt],
                         tools=self._env_tools[name] or None,  # `or None`: Llama bug: tool boilerplate for tools=[]
@@ -1760,6 +1875,7 @@ class GRPOTrainer(_BaseTrainer):
                         add_generation_prompt=True,
                         tokenize=True,
                         return_dict=True,
+                        **per_prompt_video_metadata_kwargs,
                         **self.chat_template_kwargs,
                     )
                     prompt_ids.append(tokenized["input_ids"][0])
@@ -1774,7 +1890,15 @@ class GRPOTrainer(_BaseTrainer):
                     k: torch.cat(v) if isinstance(v[0], torch.Tensor) else [row for prompt_v in v for row in prompt_v]
                     for k, v in multimodal_fields.items()
                 }
-                return prompt_ids, images, multimodal_fields
+                vllm_prompt_ids = (
+                    [
+                        _build_vllm_video_prompt_ids([prompt], self._env_tools[name] or None)[0]
+                        for prompt, name in zip(prompts, self._batch_environments, strict=True)
+                    ]
+                    if has_videos
+                    else None
+                )
+                return prompt_ids, images, videos, video_metadata, multimodal_fields, vllm_prompt_ids
 
             # Workaround for a bug in transformers 5.3.0 where some processors (e.g. Qwen2.5-VL) crash on
             # batched unpadded input (transformers#44514).
@@ -1788,6 +1912,7 @@ class GRPOTrainer(_BaseTrainer):
                 tokenize=True,
                 return_dict=True,
                 **({"padding": True} if needs_padding_workaround else {}),
+                **video_metadata_kwargs,
                 **self.chat_template_kwargs,
             )
             if needs_padding_workaround:
@@ -1800,13 +1925,19 @@ class GRPOTrainer(_BaseTrainer):
                 prompt_ids = tokenized["input_ids"]
             # For VLMs, the processor returns extra multimodal fields (pixel_values, image_grid_thw, etc.)
             multimodal_fields = {k: v for k, v in tokenized.items() if k not in ("input_ids", "attention_mask")}
+            vllm_prompt_ids = _build_vllm_video_prompt_ids(prompts, self.tools or None) if has_videos else None
         else:
             prompt_ids = self.processing_class(text=prompts)["input_ids"]
             images = None
+            videos = None
+            video_metadata = None
             multimodal_fields = {}
-        return prompt_ids, images, multimodal_fields
+            vllm_prompt_ids = None
+        return prompt_ids, images, videos, video_metadata, multimodal_fields, vllm_prompt_ids
 
-    def _generate_single_turn(self, prompt_ids, images, multimodal_fields, has_tool_images=False):
+    def _generate_single_turn(
+        self, prompt_ids, images, videos, video_metadata, multimodal_fields, has_tool_images=False, vllm_prompt_ids=None
+    ):
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
@@ -1818,11 +1949,18 @@ class GRPOTrainer(_BaseTrainer):
                     self.vllm_generation.sync_weights()
                 self._last_loaded_step = self.state.global_step
 
-            # Generate using vLLM with raw token IDs
+            # Generate using vLLM with raw token IDs. For video, `vllm_prompt_ids` (when given) is a variant of
+            # `prompt_ids` with video/image placeholders left collapsed (single token per item) instead of
+            # already expanded — vLLM does its own expansion internally, and sending it an already-expanded
+            # prompt causes it to re-expand and corrupt the sequence (see `_build_vllm_video_prompt_ids` in
+            # `_tokenize_prompts`). `prompt_ids` itself (unexpanded here) still flows through unchanged for the
+            # loss-time forward pass; only the request actually sent to vLLM uses the collapsed-placeholder form.
             num_generations = self.num_generations if mode == "train" else self.num_generations_eval
             _, completion_ids, logprobs, _ = self.vllm_generation.generate(
-                prompts=prompt_ids,
+                prompts=vllm_prompt_ids if vllm_prompt_ids is not None else prompt_ids,
                 images=images,
+                videos=videos,
+                video_metadata=video_metadata,
                 num_generations=num_generations,
                 profiler=profiling_context(self, "vLLM.generate"),
             )
@@ -1971,7 +2109,9 @@ class GRPOTrainer(_BaseTrainer):
             raise ValueError("Unexpected tokenization: the EOS-trimmed prefix IDs are not a prefix of the full IDs.")
         return full_ids[len(prefix_ids) :]
 
-    def _tool_call_loop(self, prompts, prompt_ids, completion_ids, completions, logprobs, images, multimodal_fields):
+    def _tool_call_loop(
+        self, prompts, prompt_ids, completion_ids, completions, logprobs, images, videos, video_metadata, multimodal_fields
+    ):
         # Tool execution loop: execute tools, then regenerate completions with tool results appended to the prompt
         tool_calls = [completion[0].get("tool_calls") for completion in completions]
         idxs_with_tool = [idx for idx, tool_call in enumerate(tool_calls) if tool_call]
@@ -2109,6 +2249,10 @@ class GRPOTrainer(_BaseTrainer):
                         (existing or []) + new for existing, new in zip(merged_images, tool_images, strict=True)
                     ]
             loop_images = [merged_images[i] for i in idxs_with_tool] if merged_images else None
+            # Tools that return video are not supported; the original (dataset) videos are simply carried through
+            # the loop unchanged, so a video-grounded conversation that also happens to use tools still works.
+            loop_videos = [videos[i] for i in idxs_with_tool] if videos is not None else None
+            loop_video_metadata = [video_metadata[i] for i in idxs_with_tool] if video_metadata is not None else None
             if self._is_vlm and self.tools and any(imgs for imgs in tool_images):
                 flat_loop_images = [img for img_list in loop_images if img_list for img in img_list]
                 if flat_loop_images:
@@ -2122,6 +2266,11 @@ class GRPOTrainer(_BaseTrainer):
                     multimodal_fields = {
                         **multimodal_fields,
                         "num_images": [len(img_list) if img_list else 0 for img_list in images],
+                    }
+                if "num_videos" not in multimodal_fields and videos is not None:
+                    multimodal_fields = {
+                        **multimodal_fields,
+                        "num_videos": [len(v_list) if v_list else 0 for v_list in videos],
                     }
                 split_fields = split_pixel_values_by_grid(multimodal_fields)
                 loop_multimodal_fields = {}
@@ -2143,8 +2292,15 @@ class GRPOTrainer(_BaseTrainer):
                     loop_multimodal_fields[k] = selected
                 loop_multimodal_fields = unsplit_pixel_values_by_grid(loop_multimodal_fields)
                 loop_multimodal_fields.pop("num_images", None)
+                loop_multimodal_fields.pop("num_videos", None)
                 if "pixel_values" in loop_multimodal_fields and loop_multimodal_fields["pixel_values"].numel() == 0:
                     for key in ["pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"]:
+                        loop_multimodal_fields.pop(key, None)
+                if (
+                    "pixel_values_videos" in loop_multimodal_fields
+                    and loop_multimodal_fields["pixel_values_videos"].numel() == 0
+                ):
+                    for key in ["pixel_values_videos", "video_grid_thw", "video_position_ids", "second_per_grid_ts"]:
                         loop_multimodal_fields.pop(key, None)
             else:
                 loop_multimodal_fields = {}
@@ -2153,6 +2309,8 @@ class GRPOTrainer(_BaseTrainer):
             post_tool_ids, post_tool_logprobs = self._generate_single_turn(
                 prompt_completion_tool_ids,
                 loop_images,
+                loop_videos,
+                loop_video_metadata,
                 loop_multimodal_fields,
                 has_tool_images=any(imgs for imgs in tool_images),
             )
@@ -2236,10 +2394,16 @@ class GRPOTrainer(_BaseTrainer):
             extra_fields = {k: v for k, v in output.items() if k not in required_keys}
             prompt_ids, completion_ids, logprobs = output["prompt_ids"], output["completion_ids"], output["logprobs"]
             images = None
+            videos = None
+            video_metadata = None
             multimodal_fields = {}
         else:
-            prompt_ids, images, multimodal_fields = self._tokenize_prompts(prompts)
-            completion_ids, logprobs = self._generate_single_turn(prompt_ids, images, multimodal_fields)
+            prompt_ids, images, videos, video_metadata, multimodal_fields, vllm_prompt_ids = self._tokenize_prompts(
+                prompts
+            )
+            completion_ids, logprobs = self._generate_single_turn(
+                prompt_ids, images, videos, video_metadata, multimodal_fields, vllm_prompt_ids=vllm_prompt_ids
+            )
             extra_fields = {}
 
         # Decode completions. It's important to use `parse_response` when possible, because it handles tool calls.
@@ -2270,7 +2434,7 @@ class GRPOTrainer(_BaseTrainer):
                 tool_failure_count,
                 tool_images,
             ) = self._tool_call_loop(
-                prompts, prompt_ids, completion_ids, completions, logprobs, images, multimodal_fields
+                prompts, prompt_ids, completion_ids, completions, logprobs, images, videos, video_metadata, multimodal_fields
             )
             # Merge tool response images into the images list for the forward pass
             if any(imgs for imgs in tool_images):
@@ -2325,7 +2489,94 @@ class GRPOTrainer(_BaseTrainer):
             )
             self._metrics[mode]["tools/failure_frequency"].append(failure_frequency)
 
-        return prompt_ids, completion_ids, tool_mask, completions, logprobs, extra_fields, images, tool_images
+        return (
+            prompt_ids,
+            completion_ids,
+            tool_mask,
+            completions,
+            logprobs,
+            extra_fields,
+            images,
+            videos,
+            video_metadata,
+            tool_images,
+        )
+
+    def _decode_videos_once(
+        self, raw_videos: list[list | None]
+    ) -> tuple[list[list[list] | None], list[list[dict] | None]]:
+        """
+        Decode and frame-sample each raw video exactly once, using the model's own video processor. The resulting
+        frames are reused, unchanged, for both vLLM rollout generation and the loss-time forward pass (both called
+        with `do_sample_frames=False`), so the two never decode or sample the video independently and are
+        guaranteed to see identical pixel data.
+
+        Args:
+            raw_videos (`list[list | None]`):
+                Per-example list of raw videos. Each video may be a local file path, an `http(s)://` URL, a
+                `data:video/...;base64,...` data URL, or already-decoded frames.
+
+        Returns:
+            `tuple[list[list[list] | None], list[list[dict] | None]]`: Per-example lists of, respectively, decoded
+            videos (each a `list` of `PIL.Image.Image` frames) and video metadata (one `dict` per video).
+        """
+        # Local imports: Pillow and this transformers helper aren't needed for text-only GRPO training.
+        from PIL import Image
+        from transformers.image_utils import ChannelDimension, infer_channel_dimension_format
+
+        video_processor = self.processing_class.video_processor
+        videos, video_metadata = [], []
+        for video_list in raw_videos:
+            if not video_list:
+                videos.append(None)
+                video_metadata.append(None)
+                continue
+            example_frames, example_metadata = [], []
+            for video in video_list:
+                temp_path = None
+                if isinstance(video, str) and video.startswith("data:video"):
+                    # `transformers.video_utils.load_video` only accepts a local path, an http(s) URL, or a YouTube
+                    # URL; base64 data URLs must be materialized to a temp file first.
+                    _, _, payload = video.partition(",")
+                    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+                        f.write(base64.b64decode(payload))
+                        temp_path = f.name
+                    video = temp_path
+                try:
+                    # Calling the private `_decode_and_sample_videos` (rather than the public `preprocess`) is
+                    # deliberate: it decodes and samples frames without also running the model-specific
+                    # resize/rescale/normalize step, so the raw sampled frames can be reused, unchanged, by vLLM.
+                    frames, metadata = video_processor._decode_and_sample_videos(
+                        videos=[video],
+                        video_metadata=None,
+                        do_sample_frames=True,
+                        sample_indices_fn=video_processor.sample_frames,
+                    )
+                finally:
+                    if temp_path is not None:
+                        os.remove(temp_path)
+                frames, metadata = frames[0], dict(metadata[0])
+                # Metadata fields (e.g. `frames_indices`, set from `video_processor.sample_frames`'s torch.arange
+                # default) can be torch.Tensors; convert to plain Python types so this metadata dict round-trips
+                # through JSON (sent to the vLLM server in server mode) and stays picklable everywhere else.
+                metadata = {k: v.tolist() if isinstance(v, torch.Tensor) else v for k, v in metadata.items()}
+                if hasattr(frames, "ndim"):
+                    # `frames` is a batched (num_frames, ...) array/tensor. Its channel dimension position is
+                    # backend-dependent: e.g. torchcodec returns channels-first (T, C, H, W), while other decode
+                    # backends may return channels-last (T, H, W, C). PIL's `fromarray` always expects
+                    # channels-last, so normalize before building each frame's image.
+                    frames = np.array(frames)
+                    if infer_channel_dimension_format(frames) == ChannelDimension.FIRST:
+                        frames = frames.transpose(0, 2, 3, 1)
+                    pil_frames = [Image.fromarray(frame) for frame in frames]
+                else:
+                    # Already a list of PIL frames (e.g. video supplied as a list of image paths/frames).
+                    pil_frames = list(frames)
+                example_frames.append(pil_frames)
+                example_metadata.append(metadata)
+            videos.append(example_frames)
+            video_metadata.append(example_metadata)
+        return videos, video_metadata
 
     def _generate_and_score_completions(
         self, inputs: list[dict[str, torch.Tensor | Any]]
@@ -2412,10 +2663,25 @@ class GRPOTrainer(_BaseTrainer):
         if images is not None and all(img_list == [] for img_list in images):
             images = None
 
-        # If the prompts are conversational and the inputs contain images, we need to convert the prompts from
-        # [{"role": "user", "content": "What color is the sky?"}] to
+        if "videos" in inputs[0]:
+            raw_videos = [example.get("videos") for example in inputs]
+        elif "video" in inputs[0]:
+            raw_videos = [[example.get("video")] if example.get("video") is not None else None for example in inputs]
+        else:
+            raw_videos = None
+        if raw_videos is not None and all(v_list == [] for v_list in raw_videos):
+            raw_videos = None
+        # Decode and frame-sample each video exactly once; the same decoded frames are reused, unchanged, for
+        # both vLLM rollout generation and the loss-time forward pass (see `_decode_videos_once`).
+        if raw_videos is not None:
+            videos, video_metadata = self._decode_videos_once(raw_videos)
+        else:
+            videos, video_metadata = None, None
+
+        # If the prompts are conversational and the inputs contain images/videos, we need to convert the prompts
+        # from [{"role": "user", "content": "What color is the sky?"}] to
         # [{"role": "user", "content": [{"type": "image", "image": <Image>}, {"type": "text", "text": "What color is the sky?"}]}]
-        if images is not None:
+        if images is not None or videos is not None:
             if not is_conversational(inputs[0]):
                 raise ValueError(
                     "Multimodal training requires conversational prompts. It looks like the dataset contains "
@@ -2424,11 +2690,23 @@ class GRPOTrainer(_BaseTrainer):
                     "template internally."
                 )
             prompts = [
-                prepare_multimodal_messages(prompt, images=image_list)
-                for prompt, image_list in zip(prompts, images, strict=True)
+                prepare_multimodal_messages(
+                    prompt,
+                    images=image_list,
+                    videos=video_list,
+                    video_metadata=video_meta_list,
+                )
+                for prompt, image_list, video_list, video_meta_list in zip(
+                    prompts,
+                    images if images is not None else [None] * len(prompts),
+                    videos if videos is not None else [None] * len(prompts),
+                    video_metadata if video_metadata is not None else [None] * len(prompts),
+                    strict=True,
+                )
             ]
 
         dataset_images = images  # preserve dataset images before _generate may overwrite
+        dataset_videos, dataset_video_metadata = videos, video_metadata  # preserve dataset videos likewise
         (
             prompt_ids_list,
             completion_ids_list,
@@ -2437,10 +2715,14 @@ class GRPOTrainer(_BaseTrainer):
             sampling_per_token_logps_list,
             extra_fields,
             images,
+            videos,
+            video_metadata,
             tool_images,
         ) = self._generate(prompts)
         if images is None:
             images = dataset_images  # restore dataset images (rollout_func path returns None)
+        if videos is None:
+            videos, video_metadata = dataset_videos, dataset_video_metadata  # restore dataset videos likewise
 
         # Convert lists of token IDs to padded tensors
         prompt_ids = [torch.tensor(ids) for ids in prompt_ids_list]
@@ -2504,6 +2786,7 @@ class GRPOTrainer(_BaseTrainer):
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
         num_images = [len(img_list) if img_list else 0 for img_list in images] if images is not None else None
+        num_videos = [len(v_list) if v_list else 0 for v_list in videos] if videos is not None else None
 
         # Get forward_kwargs for models with multimodal inputs.
         # When tool images are present (from _tool_call_loop), use image_processor directly and build
@@ -2514,7 +2797,7 @@ class GRPOTrainer(_BaseTrainer):
             image_inputs = self.processing_class.image_processor(images=flat_images, return_tensors="pt")
             image_inputs = super()._prepare_inputs(image_inputs)
             forward_kwargs = dict(image_inputs)
-        elif images is not None:
+        elif images is not None or videos is not None:
             if self.environment_factories is not None:
                 per_prompt_tools = [self._env_tools[name] for name in self._batch_environments]
             else:
@@ -2525,7 +2808,17 @@ class GRPOTrainer(_BaseTrainer):
                 )["prompt"]
                 for prompt, tools in zip(prompts, per_prompt_tools, strict=True)
             ]
-            prompt_inputs = self.processing_class(images=images, text=prompts_text, padding=True, return_tensors="pt")
+            processor_kwargs = {"images": images, "text": prompts_text, "padding": True, "return_tensors": "pt"}
+            if videos is not None:
+                # `do_sample_frames=False` is required: the frames were already decoded/sampled once in
+                # `_decode_videos_once`, and the exact same frames were sent to vLLM. Re-sampling here (some
+                # processors, e.g. Gemma4, default to `do_sample_frames=True`) would make the loss-time pixel
+                # values diverge from what vLLM used for rollout generation. Only passed when there actually are
+                # videos, since processors without a `video_processor` (e.g. Gemma3, LLaVA-Next) may reject it.
+                processor_kwargs["videos"] = videos
+                processor_kwargs["video_metadata"] = video_metadata
+                processor_kwargs["do_sample_frames"] = False
+            prompt_inputs = self.processing_class(**processor_kwargs)
             prompt_inputs = super()._prepare_inputs(prompt_inputs)
             forward_kwargs = {k: v for k, v in prompt_inputs.items() if k not in ["input_ids", "attention_mask"]}
         else:
@@ -2640,7 +2933,8 @@ class GRPOTrainer(_BaseTrainer):
                     batch_size,
                     num_images=num_images,
                     num_tiles=num_tiles,
-                    **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, spatial_shapes, image_sizes, image_position_ids
+                    num_videos=num_videos,
+                    **forward_kwargs,  # may contain pixel_values(_videos), image/video_grid_thw, pixel_attention_mask, spatial_shapes, image_sizes, image/video_position_ids, second_per_grid_ts
                 )
             else:
                 old_per_token_logps = None
@@ -2703,7 +2997,8 @@ class GRPOTrainer(_BaseTrainer):
                         batch_size=batch_size,
                         num_images=num_images,
                         num_tiles=num_tiles,
-                        **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, spatial_shapes, image_sizes, image_position_ids
+                        num_videos=num_videos,
+                        **forward_kwargs,  # may contain pixel_values(_videos), image/video_grid_thw, pixel_attention_mask, spatial_shapes, image_sizes, image/video_position_ids, second_per_grid_ts
                     )
                 else:
                     # When training a PEFT adapter, how we obtain the reference depends on the setup:
@@ -2719,7 +3014,8 @@ class GRPOTrainer(_BaseTrainer):
                             batch_size=batch_size,
                             num_images=num_images,
                             num_tiles=num_tiles,
-                            **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, spatial_shapes, image_sizes, image_position_ids
+                            num_videos=num_videos,
+                            **forward_kwargs,  # may contain pixel_values(_videos), image/video_grid_thw, pixel_attention_mask, spatial_shapes, image_sizes, image/video_position_ids, second_per_grid_ts
                         )
             else:
                 ref_per_token_logps = None
@@ -2914,10 +3210,20 @@ class GRPOTrainer(_BaseTrainer):
             output["mm_token_type_ids"] = forward_kwargs["mm_token_type_ids"]
         if "image_position_ids" in forward_kwargs:
             output["image_position_ids"] = forward_kwargs["image_position_ids"]
+        if "pixel_values_videos" in forward_kwargs:
+            output["pixel_values_videos"] = forward_kwargs["pixel_values_videos"]
+        if "video_grid_thw" in forward_kwargs:
+            output["video_grid_thw"] = forward_kwargs["video_grid_thw"]
+        if "video_position_ids" in forward_kwargs:
+            output["video_position_ids"] = forward_kwargs["video_position_ids"]
+        if "second_per_grid_ts" in forward_kwargs:
+            output["second_per_grid_ts"] = forward_kwargs["second_per_grid_ts"]
         if images is not None:
             output["num_images"] = num_images
             if num_tiles is not None:
                 output["num_tiles"] = num_tiles
+        if videos is not None:
+            output["num_videos"] = num_videos
         if tool_mask is not None:
             output["tool_mask"] = tool_mask
         return output
@@ -2942,6 +3248,10 @@ class GRPOTrainer(_BaseTrainer):
             inputs.get("spatial_shapes"),
             inputs.get("image_sizes"),
             inputs.get("image_position_ids"),
+            pixel_values_videos=inputs.get("pixel_values_videos"),
+            video_grid_thw=inputs.get("video_grid_thw"),
+            video_position_ids=inputs.get("video_position_ids"),
+            second_per_grid_ts=inputs.get("second_per_grid_ts"),
         )
 
         # Apply tool_mask (from env_mask) for loss computation in multi-turn training scenarios
@@ -3085,6 +3395,11 @@ class GRPOTrainer(_BaseTrainer):
             token_type_ids=inputs.get("token_type_ids"),
             mm_token_type_ids=inputs.get("mm_token_type_ids"),
             image_position_ids=inputs.get("image_position_ids"),
+            pixel_values_videos=inputs.get("pixel_values_videos"),
+            video_grid_thw=inputs.get("video_grid_thw"),
+            num_videos=inputs.get("num_videos"),
+            video_position_ids=inputs.get("video_position_ids"),
+            second_per_grid_ts=inputs.get("second_per_grid_ts"),
         )
 
         if self.top_entropy_quantile < 1.0:
